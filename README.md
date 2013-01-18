@@ -1,0 +1,4 @@
+packexe
+=======
+
+packexe: compress executable
