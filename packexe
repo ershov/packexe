@@ -1,0 +1,209 @@
+#!/usr/bin/perl -w
+
+use strict;
+use IO::File;
+
+if (@ARGV != 2) {
+	print STDERR << "_E";
+packexe: Executable files compressor.
+
+Usage: $0 infile outfile
+  The following environment variables are used:
+CC             C compiler to use (default: gcc)
+CFLAGS         Additional flags for C compiler
+DEBUG          Add flags to generate debug binary
+STATIC         Compile to static binary if possible
+GENERATE_ONLY  Print C code to stdout
+
+The latest version at https://github.com/ershov/packexe
+Report bugs to Github issue tracker or email to yuriy.ershov\@gmail.com
+_E
+	exit;
+}
+
+my ($infile, $outfile) = @ARGV;
+
+my $file_sz = -s $infile or die "$infile: $!";
+my $content;
+
+
+print "//Compressing\n";
+
+use Compress::Zlib qw/ compress /;
+IO::File->new($infile,"r")->sysread($content, $file_sz) == $file_sz or die "$infile: $!";
+$content = compress($content) or die "deflate: $!";
+my $compressed_sz = length $content;
+print "// $file_sz -> $compressed_sz (".int(100*$compressed_sz/$file_sz)."%)\n";
+
+
+print "//C sourcing\n";
+
+my $n = 0;
+my $hex = join ",", map {((($n++)%16)?"":"\n").sprintf(" 0x%02X",ord)} split //, $content;
+my $txt = do{ local $/="//@\n"; <DATA> }.qq{
+size_t zdata_sz = $file_sz;
+char zdata[$compressed_sz] = {$hex};
+}.do{ local $/=undef; <DATA> };
+
+if (exists $ENV{GENERATE_ONLY}) {
+	print $txt;
+	exit;
+}
+
+(my $qfile = $outfile) =~ s/'/'"'"'/g;
+my $CC = $ENV{CC} || "gcc";
+my $CFLAGS = exists($ENV{CFLAGS}) ? $ENV{CFLAGS} : '';
+exists($ENV{STATIC}) && $^O ne 'darwin' and $CFLAGS .= ' -static';
+exists($ENV{DEBUG}) and $CFLAGS .= " -g3 -O0 -DDEBUG";
+my $cmd = "$CC $CFLAGS -pipe -x c -o '$qfile' - -lz";
+
+print "//Compiling\n// $cmd\n";
+IO::File->new("|$cmd")->print($txt);
+$? == 0 ? system("strip '$qfile'") : unlink $outfile;
+
+__DATA__
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <zlib.h>
+#include <stdint.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+
+// size_t zdata_sz; char zdata[]; insertion point! //@
+
+#define WINDOWBITS	15
+
+#ifdef DEBUG
+#define LOG	printf
+#else
+#define LOG (void)
+#endif
+
+int main(int argc, char **argv)
+{
+	// open outfile
+	char * dirname = strdup("/tmp/XXXXXX");
+	dirname = mkdtemp(dirname);
+	char * progname = strrchr(argv[0], '/');
+	if (!progname) { progname = argv[0]; }
+	char * fname = malloc(strlen(dirname) + strlen(progname) + 2);
+	strcpy(fname, dirname);
+	strcat(fname, "/");
+	strcat(fname, progname);
+
+#ifdef DEBUG
+	LOG("dir=%s file=%s\n", dirname, fname);
+	LOG("open %s\n", fname);
+	char s[100];
+	sprintf(s, "ls -ld %s %s", fname, dirname);
+	system(s);
+#endif // DEBUG
+
+#define CLEANUP		unlink(fname); rmdir(dirname);
+#define FAIL(MSG)	perror(MSG); CLEANUP; exit(1);
+
+	int fd = open(fname, O_RDWR|O_CREAT|O_EXCL);
+	if (fd < 0) {
+		FAIL("open")
+	}
+	if (fchmod(fd, 0700) == -1) {
+		FAIL("chmod")
+	}
+	if (ftruncate(fd, zdata_sz) == -1) {
+		FAIL("ftruncate")
+	}
+	uint8_t *unpacked = (uint8_t*)mmap(NULL, zdata_sz, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+	if (unpacked == MAP_FAILED) {
+		FAIL("mmap")
+	}
+
+#ifdef DEBUG
+	system(s);
+#endif // DEBUG
+
+	// open zlib
+	LOG("open zlib\n");
+	z_stream strm;
+
+	memset(&strm, 0, sizeof(strm));
+
+	strm.next_in = zdata;
+	LOG(" data size=%lu\n", sizeof(zdata));
+	strm.total_in = strm.avail_in = sizeof(zdata);
+
+	strm.next_out = unpacked;
+	strm.avail_out = zdata_sz;
+	strm.total_out = 0;
+#define ZFAIL(MSG)	fprintf(stderr, "zlib %s: (%d) %s\n", MSG, zerr, strm.msg); CLEANUP; exit(1);
+	int zerr;
+
+	// unpack
+	LOG("unpack init\n");
+	if ((zerr=inflateInit(&strm)) != Z_OK) {
+		ZFAIL("init")
+	}
+	LOG("unpack\n");
+	if ((zerr=inflate(&strm, 1)) != Z_STREAM_END) {
+		ZFAIL("inflate")
+	}
+	LOG("finish\n");
+	if ((zerr=inflateEnd(&strm)) != Z_OK) {
+		ZFAIL("end")
+	}
+
+	// cleanup
+	LOG("cleanup\n");
+	if (munmap(unpacked, zdata_sz) != 0) {
+		FAIL("munmap");
+	}
+	close(fd);
+
+	// launch
+	int f = fork();
+	if (f == -1) {
+		FAIL("fork");
+	}
+	if (f == 0) {
+		// in child:
+
+		// release parent from waiting
+		f = fork();
+		if (f == -1) {
+			FAIL("fork2");
+		}
+		if (f != 0) {
+			exit(0);
+		}
+		// in child of child:
+
+		// delete the executable after a while
+		LOG("sleep\n");
+		sleep(1);
+		LOG("delete %s\n", fname);
+		CLEANUP;
+		exit(0);
+	}
+
+	// in parent:
+
+	// wait for child termination
+	signal(SIGCHLD, SIG_IGN);
+	int chld_exit;
+	LOG("wait\n");
+	while (wait(&chld_exit) == -1 && errno == EINTR) {
+		LOG("wait...\n");
+	}
+	LOG("wakeup\n");
+
+	// run application
+	LOG("exec %s\n", fname);
+	execve(fname, argv, NULL);
+	FAIL("exec")
+}
+
